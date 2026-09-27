@@ -3632,20 +3632,19 @@ static void bio_destructor_tp(struct bio *bio){
 	struct tracing_params *tp = bio->bi_private;
 	bio_free(bio, dev_bioset(tp->dev));
 }
-
-static void bio_destructor_snap_dev(struct bio *bio){
-	struct snap_device *dev = bio->bi_private;
-	bio_free(bio, dev_bioset(dev));
-}
 #endif
 
 static void bio_free_clone(struct bio *bio){
+	struct tracing_params *tp = bio->bi_private;
 #ifdef NETLINK_DEBUG
 	nl_trace_event_bio(NL_EVENT_BIO_FREE, bio, 0);
 #endif
 
 	bio_free_pages(bio);
 	bio_put(bio);
+	/* The clone owns its tracing reference until COW processing (or error
+	 * cleanup) finishes. Keep tp alive through the bio destructor. */
+	tp_put(tp);
 }
 
 static int bio_make_read_clone(struct block_device *bdev, struct bio_set *bs, struct tracing_params *tp, struct bio *orig_bio, sector_t sect, unsigned int pages, struct bio **bio_out, unsigned int *bytes_added){
@@ -4192,26 +4191,19 @@ static void __on_bio_read_complete(struct bio *bio, int err){
 	}
 #endif
 
-	/*
-	 * drop our reference to the tp (will queue the orig_bio if nobody else is using it)
-	 * at this point we set bi_private to the snap_device and change the destructor to use
-	 * that instead. This only matters on older kernels
+	/* Retain the clone's tracing reference while it waits for the COW worker.
+	 * Releasing the original write here can race with a snapshot read whose
+	 * unmapped range is already being read from the base device. Both COW
+	 * writes and snapshot reads run on sd_cow_thread: releasing the original
+	 * only after COW processing makes the saved mapping visible first.
 	 */
-	bio->bi_private = dev;
-#ifndef HAVE_BIO_BI_POOL
-	bio->bi_destructor = bio_destructor_snap_dev;
-#endif
-
-	//queue cow bio for processing by kernel thread
-	bio_queue_add(&dev->sd_cow_bios, bio);
-	atomic64_inc(&dev->sd_received_cnt);
-	smp_wmb();
-
 #ifdef NETLINK_DEBUG
 	nl_trace_event_bio(NL_EVENT_BIO_QUEUED, bio, 0);
 #endif
-
-	tp_put(tp);
+	/* Queueing transfers ownership; the worker may immediately free bio. */
+	bio_queue_add(&dev->sd_cow_bios, bio);
+	atomic64_inc(&dev->sd_received_cnt);
+	smp_wmb();
 
 	return;
 
@@ -4221,7 +4213,6 @@ error:
 	nl_trace_event_generic(NL_EVENT_DRIVER_ERROR, ret);
 #endif
 	tracer_set_fail_state(dev, ret);
-	tp_put(tp);
 	bio_free_clone(bio);
 }
 
@@ -5815,13 +5806,18 @@ static int tracer_active_inc_to_snap(struct snap_device *old_dev, const char *co
 	ret = __tracer_setup_snap_cow_thread(dev, old_dev->sd_minor);
 	if(ret) goto error;
 
+	/* The new COW manager is independent of the old tracking manager.
+	 * Thawing after tracing switches can synchronously write the superblock;
+	 * its original bio now waits for COW processing, so start this worker
+	 * before installing the new tracer and thawing the filesystem. */
+	wake_up_process(dev->sd_cow_thread);
+
 	//start tracing (overwrites old_dev's tracing)
 	ret = __tracer_setup_tracing(dev, old_dev->sd_minor);
 	if(ret) goto error;
 
-	//stop the old cow thread and start the new one
+	//stop the old tracking worker before closing its COW index
 	__tracer_destroy_cow_thread(old_dev);
-	wake_up_process(dev->sd_cow_thread);
 
 	//destroy the unneeded fields of the old_dev and the old_dev itself
 	__tracer_destroy_cow_path(old_dev);
