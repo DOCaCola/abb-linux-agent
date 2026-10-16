@@ -1590,6 +1590,7 @@ static int file_open(const char *filename, int flags, struct file **filp){
 		goto error;
 	}
 	f->f_mode |= FMODE_NONOTIFY;
+	f->f_inode->i_flags |= S_NOCMTIME;
 
 	*filp = f;
 	return 0;
@@ -2119,7 +2120,12 @@ static inline ssize_t elastio_snap_kernel_write(struct cow_manager *cm, void *bu
 
 		return ret;
 #else
-		ret = kernel_write(cm->filp, buf, count, pos);
+		/* The COW worker is part of the origin's freeze/thaw operation.
+		 * Thaw can submit a superblock write which waits for its saved COW
+		 * block. Taking sb_start_write here would wait for thaw itself.
+		 * These preallocated internal writes must bypass the ordinary
+		 * filesystem writer admission, like the dormant direct-I/O path. */
+		ret = __kernel_write(cm->filp, buf, count, pos);
 		return ret;
 #endif
 	} else {
@@ -3013,6 +3019,13 @@ static int cow_reload(struct snap_device *dev, const char *path, uint64_t elemen
 		}
 	}
 
+	/* The persisted index already owns every section, including sections
+	 * whose mappings are all zero. Lazy access must load it, not allocate
+	 * a new empty section and discard changes recorded before the reboot. */
+	{
+		unsigned long i;
+		for (i = 0; i < cm->total_sects; ++i) cm->sects[i].has_data = 1;
+	}
 	*cm_out = cm;
 	return 0;
 
@@ -3112,6 +3125,24 @@ static int cow_init(struct snap_device *dev, const char *path, uint64_t elements
 	ret = file_allocate(cm, cm->filp, 0, file_max);
 	if(ret) goto error;
 
+	/* Internal COW writes must never allocate extents or join a filesystem
+	 * metadata transaction while origin writes are waiting for their saved
+	 * data. Initialize preallocated extents before tracing is installed,
+	 * then write COW data/index without inode timestamp transactions. */
+	{
+		void *zero = (void *)get_zeroed_page(GFP_KERNEL);
+		uint64_t at;
+		if (!zero) { ret = -ENOMEM; goto error; }
+		for (at = 0; at < file_max; at += PAGE_SIZE) {
+			ret = file_write(cm, zero, at, min_t(uint64_t, PAGE_SIZE, file_max - at));
+			if (ret) break;
+			cond_resched();
+		}
+		free_page((unsigned long)zero);
+		if (ret) goto error;
+		ret = vfs_fsync(cm->filp, 0);
+		if (ret) goto error;
+	}
 	dev->sd_cow_inode = cm->filp->f_inode;
 
 	*cm_out = cm;
@@ -6810,6 +6841,7 @@ static void post_umount_check(int dormant_ret, long umount_ret, unsigned int idx
 #endif
 
 #ifdef USE_ARCH_MOUNT_FUNCS
+static asmlinkage long (*orig_mount)(struct pt_regs *regs);
 #ifdef USE_NEW_MOUNT_API
 // kernel >= 6.6
 static asmlinkage long (*orig_move_mount)(struct pt_regs *regs);
@@ -6899,14 +6931,10 @@ struct mount {
 	struct hlist_head mnt_stuck_children;
 } __randomize_layout;
 
-#else
-static asmlinkage long (*orig_mount)(struct pt_regs *regs);
 #endif //USE_NEW_MOUNT_API
 static asmlinkage long (*orig_umount)(struct pt_regs *regs);
 #else
-#ifndef USE_NEW_MOUNT_API
 static asmlinkage long (*orig_mount)(char __user *, char __user *, char __user *, unsigned long, void __user *);
-#endif //USE_NEW_MOUNT_API
 static asmlinkage long (*orig_umount)(char __user *name, int flags);
 #endif
 
@@ -6917,8 +6945,7 @@ static asmlinkage long (*orig_oldumount)(char __user *);
 
 // MOUNT HOOKS
 
-#ifndef USE_NEW_MOUNT_API
-// kernel < 6.6
+// Legacy mount(2) remains available alongside the new mount API.
 #ifdef USE_ARCH_MOUNT_FUNCS
 static asmlinkage long mount_hook(struct pt_regs *regs){
 #else
@@ -6958,10 +6985,22 @@ static asmlinkage long mount_hook(char __user *dev_name, char __user *dir_name, 
 		return -ENOMEM;
 	}
 
-	ret_dev = copy_from_user(buff_dev_name, dev_name, PATH_MAX);
-	ret_dir = copy_from_user(buff_dir_name, dir_name, PATH_MAX);
+	ret_dev = dev_name ? strncpy_from_user(buff_dev_name, dev_name, PATH_MAX) : -EFAULT;
+	ret_dir = strncpy_from_user(buff_dir_name, dir_name, PATH_MAX);
 
-	if(ret_dev || ret_dir)
+	/* A remount may pass NULL as its source. Resolve the existing mount's
+	 * block device before the writable transition so its first writes are
+	 * queued by the unverified incremental tracer. */
+	if (real_flags & MS_REMOUNT) {
+		struct path target;
+		if (!user_path_at(AT_FDCWD, dir_name, LOOKUP_FOLLOW, &target)) {
+			struct block_device *bdev = target.mnt->mnt_sb->s_bdev;
+			if (bdev) ret_dev = snprintf(buff_dev_name, PATH_MAX, "/dev/%pg", bdev);
+			path_put(&target);
+		}
+	}
+
+	if(ret_dev < 0 || ret_dir < 0 || ret_dev >= PATH_MAX || ret_dir >= PATH_MAX)
 		LOG_DEBUG("detected block device Get mount params error!, %d, %d, 0x%lx", ret_dev, ret_dir, flags);
 	else
 		LOG_DEBUG("detected block device mount: %s -> %s : 0x%lx", buff_dev_name,
@@ -6970,7 +7009,10 @@ static asmlinkage long mount_hook(char __user *dev_name, char __user *dir_name, 
 	//get rid of the magic value if its present
 	if((real_flags & MS_MGC_MSK) == MS_MGC_VAL) real_flags &= ~MS_MGC_MSK;
 
-	if(real_flags & (MS_BIND | MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE | MS_MOVE) || ((real_flags & MS_RDONLY) && !(real_flags & MS_REMOUNT))){
+	if((real_flags & MS_BIND) ||
+	   (!(real_flags & MS_REMOUNT) &&
+	    (real_flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE | MS_MOVE))) ||
+	   ((real_flags & MS_RDONLY) && !(real_flags & MS_REMOUNT))){
 		//bind, shared, move, or new read-only mounts it do not affect the state of the driver
 #ifdef USE_ARCH_MOUNT_FUNCS
 		sys_ret = orig_mount(regs);
@@ -6990,7 +7032,7 @@ static asmlinkage long mount_hook(char __user *dev_name, char __user *dir_name, 
 		post_umount_check(ret, sys_ret, idx, dir_name, 1);
 	} else{
 		//new read-write mount
-		ret = setup_traced(buff_dev_name);
+		ret = (ret_dev > 0 && ret_dev < PATH_MAX) ? setup_traced(buff_dev_name) : 0;
 		if(ret) {
 			LOG_ERROR(ret, "failed to setup traced");
 		}
@@ -7009,7 +7051,7 @@ static asmlinkage long mount_hook(char __user *dev_name, char __user *dir_name, 
 
 	return sys_ret;
 }
-#else 
+#ifdef USE_NEW_MOUNT_API
 // kernel >= 6.6
 
 #ifndef HAVE_BDEV_FREEZE
@@ -7499,85 +7541,51 @@ static asmlinkage long oldumount_hook(char __user *name){
 
 static void **system_call_table = NULL;
 static void **find_sys_call_table(void){
-#ifdef USE_NEW_MOUNT_API
-	// kernel 6.6
-	long long move_mount_address = 0;
-	long long mount_setattr_address = 0;
-	long long fsconfig_address = 0;
-#else
-	long long mount_address = 0;
-#endif
-	long long umount_address = 0;
-	long long offset = 0;
+	long long mount_address = SYS_MOUNT_ADDR;
+	long long umount_address = SYS_UMOUNT_ADDR;
+	long long offset;
 	void **sct;
-
-	if(!SYS_CALL_TABLE_ADDR)
-		return NULL;
-
-// On kernels after 4.9+, sys_mount() & sys_umount()
-// have been switched to the architecture-dependent
-// functions, f.e., __x86_64_sys_mount() or __arm64_sys_umount()
-// These functions use 'struct pt_regs *' as a parameter.
-// Hence, we added additional define USE_ARCH_MOUNT_FUNCS
-// to support mount hooks on different kernels
-#if !defined(USE_ARCH_MOUNT_FUNCS) && !defined(USE_NEW_MOUNT_API)
-// USE_ARCH_MOUNT_FUNCS and kernel < 6.6
-	mount_address = SYS_MOUNT_ADDR;
-	umount_address = SYS_UMOUNT_ADDR;
-#else
-#if __X64_SYS_MOUNT_ADDR
 #ifdef USE_NEW_MOUNT_API
-// kernel >= 6.6
+	long long move_mount_address;
+	long long mount_setattr_address;
+	long long fsconfig_address;
+#endif
+	if (!SYS_CALL_TABLE_ADDR) return NULL;
+#ifdef USE_ARCH_MOUNT_FUNCS
+#if __X64_SYS_MOUNT_ADDR
+	mount_address = __X64_SYS_MOUNT_ADDR;
+	umount_address = __X64_SYS_UMOUNT_ADDR;
+#ifdef USE_NEW_MOUNT_API
 	move_mount_address = __X64_SYS_MOVE_MOUNT_ADDR;
 	mount_setattr_address = __X64_SYS_MOUNT_SETATTR_ADDR;
 	fsconfig_address = __X64_SYS_FSCONFIG_ADDR;
-#else // USE_NEW_MOUNT_API
-	mount_address = __X64_SYS_MOUNT_ADDR;
-#endif // USE_NEW_MOUNT_API
-	umount_address = __X64_SYS_UMOUNT_ADDR;
+#endif
 #elif __ARM64_SYS_MOUNT_ADDR
+	mount_address = __ARM64_SYS_MOUNT_ADDR;
+	umount_address = __ARM64_SYS_UMOUNT_ADDR;
 #ifdef USE_NEW_MOUNT_API
-// kernel >= 6.6
 	move_mount_address = __ARM64_SYS_MOVE_MOUNT_ADDR;
 	mount_setattr_address = __ARM64_SYS_MOUNT_SETATTR_ADDR;
 	fsconfig_address = __ARM64_SYS_FSCONFIG_ADDR;
-#else
-	mount_address = __ARM64_SYS_MOUNT_ADDR;
 #endif
-	umount_address = __ARM64_SYS_UMOUNT_ADDR;
 #else
 #error "Architecture not supported"
 #endif
 #endif
-
-
-#ifdef USE_NEW_MOUNT_API
-// kernel >= 6.6
-	if (!move_mount_address || !mount_setattr_address || !umount_address || !fsconfig_address)
-		return NULL;
-#else
-	if (!mount_address || !umount_address)
-		return NULL;
-#endif // USE_NEW_MOUNT_API
-
+	if (!mount_address || !umount_address) return NULL;
 	offset = ((void *)kfree) - (void *)KFREE_ADDR;
 	sct = (void **)SYS_CALL_TABLE_ADDR + offset / sizeof(void **);
-
+	if (sct[__NR_mount] != (void **)mount_address + offset / sizeof(void **)) return NULL;
+	if (sct[__NR_umount2] != (void **)umount_address + offset / sizeof(void **)) return NULL;
 #ifdef USE_NEW_MOUNT_API
-// kernel >= 6.6
-	if(sct[__NR_move_mount] != (void **)move_mount_address + offset / sizeof(void **)) return NULL;
-	if(sct[__NR_mount_setattr] != (void **)mount_setattr_address + offset / sizeof(void **)) return NULL;
-	if(sct[__NR_fsconfig] != (void **)fsconfig_address + offset / sizeof(void **)) return NULL;
-#else	
-	if(sct[__NR_mount] != (void **)mount_address + offset / sizeof(void **)) return NULL;
-#endif // USE_NEW_MOUNT_API
-	if(sct[__NR_umount2] != (void **)umount_address + offset / sizeof(void **)) return NULL;
-#ifdef HAVE_SYS_OLDUMOUNT
-	if(sct[__NR_umount] != (void **)SYS_OLDUMOUNT_ADDR + offset / sizeof(void **)) return NULL;
+	if (!move_mount_address || !mount_setattr_address || !fsconfig_address) return NULL;
+	if (sct[__NR_move_mount] != (void **)move_mount_address + offset / sizeof(void **)) return NULL;
+	if (sct[__NR_mount_setattr] != (void **)mount_setattr_address + offset / sizeof(void **)) return NULL;
+	if (sct[__NR_fsconfig] != (void **)fsconfig_address + offset / sizeof(void **)) return NULL;
 #endif
-
-	LOG_DEBUG("system call table located at 0x%p", sct);
-
+#ifdef HAVE_SYS_OLDUMOUNT
+	if (sct[__NR_umount] != (void **)SYS_OLDUMOUNT_ADDR + offset / sizeof(void **)) return NULL;
+#endif
 	return sct;
 }
 
@@ -7693,14 +7701,12 @@ static void restore_system_call_table(void)
 		LOG_DEBUG("restoring system call table");
 
 		preempt_disable();
+		syscall_set_hook(system_call_table, __NR_mount, NULL, orig_mount);
 #ifdef USE_NEW_MOUNT_API
 		// kernel >= 6.6
 		syscall_set_hook(system_call_table, __NR_move_mount, NULL, orig_move_mount);
 		syscall_set_hook(system_call_table, __NR_mount_setattr, NULL, orig_mount_setattr);
 		syscall_set_hook(system_call_table, __NR_fsconfig, NULL, orig_fsconfig);
-#else
-		// break back into the syscall table and replace the hooks we stole
-		syscall_set_hook(system_call_table, __NR_mount, NULL, orig_mount);
 #endif // USE_NEW_MOUNT_API
 		syscall_set_hook(system_call_table, __NR_umount2, NULL, orig_umount);
 #ifdef HAVE_SYS_OLDUMOUNT
@@ -7728,14 +7734,12 @@ static int hook_system_call_table(void)
 	}
 
 	preempt_disable();
+	ret = syscall_set_hook(system_call_table, __NR_mount, (void **) &orig_mount, mount_hook);
 #ifdef USE_NEW_MOUNT_API
 // kernel >= 6.6
-	ret = syscall_set_hook(system_call_table, __NR_move_mount, (void **) &orig_move_mount, move_mount_hook);
+	ret |= syscall_set_hook(system_call_table, __NR_move_mount, (void **) &orig_move_mount, move_mount_hook);
 	ret |= syscall_set_hook(system_call_table, __NR_mount_setattr, (void **) &orig_mount_setattr, mount_setattr_hook);
 	ret |= syscall_set_hook(system_call_table, __NR_fsconfig, (void **) &orig_fsconfig, fsconfig_hook);
-#else
-	//break into the syscall table and steal the hooks we need
-	ret = syscall_set_hook(system_call_table, __NR_mount, (void **) &orig_mount, mount_hook);
 #endif // USE_NEW_MOUNT_API
 	ret |= syscall_set_hook(system_call_table, __NR_umount2, (void **) &orig_umount, umount_hook);
 #ifdef HAVE_SYS_OLDUMOUNT
@@ -7793,12 +7797,11 @@ struct ftrace_hook {
 #define USE_FENTRY_OFFSET 0
 
 static struct ftrace_hook ftrace_hooks[] = {
+	HOOK("__x64_sys_mount", mount_hook, &orig_mount),
 #ifdef USE_NEW_MOUNT_API
 	HOOK("__x64_sys_mount_setattr", mount_setattr_hook, &orig_mount_setattr),
 	HOOK("__x64_sys_move_mount", move_mount_hook, &orig_move_mount),
 	HOOK("__x64_sys_fsconfig", fsconfig_hook, &orig_fsconfig),
-#else
-	HOOK("__x64_sys_mount", mount_hook, &orig_mount),
 #endif
 	HOOK("__x64_sys_umount", umount_hook, &orig_umount),
 };
@@ -7944,6 +7947,8 @@ static int unregister_hook(struct ftrace_hook *hook)
 	return ret;
 }
 
+static bool ftrace_hooks_registered;
+
 static int register_ftrace_hooks(void)
 {
 	int ret = 0;
@@ -7956,6 +7961,7 @@ static int register_ftrace_hooks(void)
 			goto error;
 	}
 
+	ftrace_hooks_registered = true;
 	return 0;
 error:
 	while (i != 0) {
@@ -7970,10 +7976,12 @@ static int unregister_ftrace_hooks(void)
 	int i;
 	int count = ARRAY_SIZE(ftrace_hooks);
 
+	if (!ftrace_hooks_registered) return 0;
 	for (i = 0; i < count; i++) {
 		unregister_hook(&ftrace_hooks[i]);
 	}
 
+	ftrace_hooks_registered = false;
 	return ret;
 }
 

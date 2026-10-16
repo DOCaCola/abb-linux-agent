@@ -70,7 +70,8 @@ int fsconfig_hook_extract_params(struct pt_regs *regs, int *fd , unsigned int *c
 #endif
 	return 0;
 }
-#else
+#endif // USE_NEW_MOUNT_API
+
 int mount_hook_extract_params(struct pt_regs *regs, char **dev_name, char **dir_name, unsigned long *flags)
 {
 	if (!regs || !dev_name || !dir_name || !flags) return -EINVAL;
@@ -87,7 +88,6 @@ int mount_hook_extract_params(struct pt_regs *regs, char **dev_name, char **dir_
 	return 0;
 }
 
-#endif //USE_NEW_MOUNT_API
 
 
 int umount_hook_extract_params(struct pt_regs *regs, char **dev_name, unsigned long *flags)
