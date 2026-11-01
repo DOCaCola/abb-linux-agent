@@ -1051,6 +1051,7 @@ struct bio_sector_map{
 	struct bio *bio;
 	sector_t sect;
 	unsigned int size;
+	bool orig_released; // dormant clone has released its origin-write dependency
 	struct bio_sector_map *next;
 };
 
@@ -1062,7 +1063,8 @@ struct bsector_list {
 struct tracing_params{
 	struct bio *orig_bio;
 	struct snap_device *dev;
-	atomic_t refs;
+	atomic_t refs; // tracing context / clone lifetime
+	atomic_t orig_refs; // dependencies delaying the original write
 	struct bsector_list bio_sects;
 };
 
@@ -3507,6 +3509,7 @@ static int tp_alloc(struct snap_device *dev, struct bio *bio, struct tracing_par
 	tp->bio_sects.head = NULL;
 	tp->bio_sects.tail = NULL;
 	atomic_set(&tp->refs, 1);
+	atomic_set(&tp->orig_refs, 1);
 
 	*tp_out = tp;
 	return 0;
@@ -3514,28 +3517,32 @@ static int tp_alloc(struct snap_device *dev, struct bio *bio, struct tracing_par
 
 static void tp_get(struct tracing_params *tp){
 	atomic_inc(&tp->refs);
+	atomic_inc(&tp->orig_refs);
 }
 
-static void tp_put(struct tracing_params *tp){
-	//drop a reference to the tp
-	if(atomic_dec_and_test(&tp->refs)){
-		struct bio_sector_map *next, *curr = NULL;
-
-		//if there are no references left, its safe to release the orig_bio
+static void tp_release_orig(struct tracing_params *tp){
+	if(atomic_dec_and_test(&tp->orig_refs)){
 		bio_queue_add(&tp->dev->sd_orig_bios, tp->orig_bio);
-
 #ifdef NETLINK_DEBUG
-		nl_trace_event_bio(NL_EVENT_BIO_RELEASED, tp->orig_bio, 0);		
+		nl_trace_event_bio(NL_EVENT_BIO_RELEASED, tp->orig_bio, 0);
 #endif
+	}
+}
 
-		// free nodes in the sector map list
-		for (curr = tp->bio_sects.head; curr != NULL; curr = next)
-		{
+static void tp_release(struct tracing_params *tp){
+	if(atomic_dec_and_test(&tp->refs)){
+		struct bio_sector_map *next, *curr;
+		for(curr = tp->bio_sects.head; curr != NULL; curr = next){
 			next = curr->next;
 			kfree(curr);
 		}
 		kfree(tp);
 	}
+}
+
+static void tp_put(struct tracing_params *tp){
+	tp_release_orig(tp);
+	tp_release(tp);
 }
 
 static int tp_add(struct tracing_params* tp, struct bio* bio) {
@@ -3667,6 +3674,15 @@ static void bio_destructor_tp(struct bio *bio){
 
 static void bio_free_clone(struct bio *bio){
 	struct tracing_params *tp = bio->bi_private;
+	struct bio_sector_map *map;
+	bool orig_released = false;
+
+	for(map = tp->bio_sects.head; map != NULL; map = map->next){
+		if(map->bio == bio){
+			orig_released = map->orig_released;
+			break;
+		}
+	}
 #ifdef NETLINK_DEBUG
 	nl_trace_event_bio(NL_EVENT_BIO_FREE, bio, 0);
 #endif
@@ -3675,7 +3691,8 @@ static void bio_free_clone(struct bio *bio){
 	bio_put(bio);
 	/* The clone owns its tracing reference until COW processing (or error
 	 * cleanup) finishes. Keep tp alive through the bio destructor. */
-	tp_put(tp);
+	if(orig_released) tp_release(tp);
+	else tp_put(tp);
 }
 
 static int bio_make_read_clone(struct block_device *bdev, struct bio_set *bs, struct tracing_params *tp, struct bio *orig_bio, sector_t sect, unsigned int pages, struct bio **bio_out, unsigned int *bytes_added){
@@ -4180,6 +4197,9 @@ static int inc_sset_thread(void *data){
 
 static void __on_bio_read_complete(struct bio *bio, int err){
 	int ret;
+	unsigned long flags;
+	bool dormant;
+	struct bio_queue *bq;
 	struct tracing_params *tp = bio->bi_private;
 	struct snap_device *dev = tp->dev;
 	struct bio_sector_map* map = NULL;
@@ -4231,10 +4251,28 @@ static void __on_bio_read_complete(struct bio *bio, int err){
 #ifdef NETLINK_DEBUG
 	nl_trace_event_bio(NL_EVENT_BIO_QUEUED, bio, 0);
 #endif
-	/* Queueing transfers ownership; the worker may immediately free bio. */
-	bio_queue_add(&dev->sd_cow_bios, bio);
+	/* Serialize dormancy selection and clone publication with reactivation.
+	 * Every early-released clone must precede newly admitted snapshot reads.
+	 * Readers are quiesced before ACTIVE is cleared. During dormancy their
+	 * old data stays buffered, as in stock, while final ext4 writes complete.
+	 */
+	bq = &dev->sd_cow_bios;
+	spin_lock_irqsave(&bq->lock, flags);
+	dormant = !test_bit(ACTIVE, &dev->sd_state);
+	if(dormant){
+		map->orig_released = true;
+		/* Keep tp alive if the worker frees this clone after publication. */
+		atomic_inc(&tp->refs);
+	}
+	bio_list_add(&bq->bios, bio);
+	spin_unlock_irqrestore(&bq->lock, flags);
+	wake_up(&bq->event);
 	atomic64_inc(&dev->sd_received_cnt);
 	smp_wmb();
+	if(dormant){
+		tp_release_orig(tp);
+		tp_release(tp);
+	}
 
 	return;
 
@@ -4676,8 +4714,21 @@ static MRF_RETURN_TYPE snap_mrf(struct bio *bio){
 		MRF_RETURN(0);
 	}
 
-	//queue bio for processing by kernel thread
-	bio_queue_add(&dev->sd_cow_bios, bio);
+	/* Recheck at admission: the stop path pairs with this queue lock before
+	 * kthread_stop, so a reader cannot queue behind a stopped COW worker. */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+		if(!test_bit(ACTIVE, &dev->sd_state) ||
+				elastio_snap_request_queue_stopped(dev->sd_queue)){
+			spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+			elastio_snap_bio_endio(bio, -EBUSY);
+			MRF_RETURN(0);
+		}
+		bio_list_add(&dev->sd_cow_bios.bios, bio);
+		spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+		wake_up(&dev->sd_cow_bios.event);
+	}
 
 	MRF_RETURN(0);
 }
@@ -5436,7 +5487,8 @@ error:
 	return ret;
 }
 
-static void __tracer_destroy_cow_thread(struct snap_device *dev){
+static void __tracer_stop_cow_readers(struct snap_device *dev){
+	unsigned long flags;
 	if(dev->sd_cow_thread){
 		LOG_DEBUG("stopping cow thread");
 		/* Need to wait the readers to complete, otherwise
@@ -5448,10 +5500,24 @@ static void __tracer_destroy_cow_thread(struct snap_device *dev){
 		 * for the issue description
 		 */
 		elastio_snap_stop_request_queue(dev->sd_queue);
+		/* Pair with snapshot admission under this lock before stopping the
+		 * worker: every reader admitted before the stop is now queued. */
+		spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+		spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
 		elastio_snap_wait_for_release(dev);
+	}
+}
+
+static void __tracer_stop_cow_thread(struct snap_device *dev){
+	if(dev->sd_cow_thread){
 		kthread_stop(dev->sd_cow_thread);
 		dev->sd_cow_thread = NULL;
 	}
+}
+
+static void __tracer_destroy_cow_thread(struct snap_device *dev){
+	__tracer_stop_cow_readers(dev);
+	__tracer_stop_cow_thread(dev);
 }
 
 static int __tracer_setup_cow_thread(struct snap_device *dev, unsigned int minor, int is_snap){
@@ -6326,17 +6392,29 @@ static long ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
 
 static void __tracer_active_to_dormant(struct snap_device *dev){
 	int ret;
+	unsigned long flags;
+	struct bio *bio;
+	struct bio_sector_map *map;
+	struct tracing_params *tp;
 
-	//stop the cow thread
+	/* Stop and drain readers while active write ordering still holds. A
+	 * read clone may complete after the worker has observed an empty queue;
+	 * publish dormancy and release those queued writes under the same lock
+	 * that classifies new completions. No snapshot readers remain now. */
 	__tracer_destroy_cow_thread(dev);
+	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+	clear_bit(ACTIVE, &dev->sd_state);
+	bio_list_for_each(bio, &dev->sd_cow_bios.bios){
+		tp = bio->bi_private;
+		for(map = tp->bio_sects.head; map->bio != bio; map = map->next);
+		map->orig_released = true;
+		tp_release_orig(tp);
+	}
+	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
 
 	//close the cow manager
 	ret = __tracer_destroy_cow_sync_and_close(dev);
 	if(ret) goto error;
-
-	//mark as dormant
-	smp_wmb();
-	clear_bit(ACTIVE, &dev->sd_state);
 
 	return;
 
@@ -6506,6 +6584,7 @@ error:
 
 static void __tracer_dormant_to_active(struct snap_device *dev, const char *user_mount_path, int is_user_space){
 	int ret;
+	unsigned long flags;
 	char *cow_path;
 
 	// generate the full pathname
@@ -6514,6 +6593,13 @@ static void __tracer_dormant_to_active(struct snap_device *dev, const char *user
 
 	ret = __tracer_setup_cow_reopen(dev, dev->sd_base_dev, cow_path);
 	if(ret) goto error;
+
+	/* All dormant completions publish their saved bytes under this lock.
+	 * Switch ordering before setup reopens the snapshot reader queue; the
+	 * single COW worker processes those writes before any new reads. */
+	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+	set_bit(ACTIVE, &dev->sd_state);
+	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
 
 	//restart the cow thread
 	if(test_bit(SNAPSHOT, &dev->sd_state)) ret = __tracer_setup_snap_cow_thread(dev, dev->sd_minor);
@@ -6525,7 +6611,6 @@ static void __tracer_dormant_to_active(struct snap_device *dev, const char *user
 
 	//set the state to active
 	smp_wmb();
-	set_bit(ACTIVE, &dev->sd_state);
 	clear_bit(UNVERIFIED, &dev->sd_state);
 
 	return;
