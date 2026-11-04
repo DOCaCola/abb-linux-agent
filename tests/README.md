@@ -70,7 +70,7 @@ Keep build output, source commit, `uname -a`, module SHA-256 and `modinfo`.
 
 The test requires root and an initially unloaded synosnap module. It creates its
 own 1 GiB loop image, mounts only that image, puts the COW under its own mounted
-`.synosnap_data`, and keeps a writer/fsync workload active across setupâ†’tracking.
+`.synosnap_data`, and keeps a writer/fsync workload active across setup→tracking.
 Every repetition is a fresh snapshot, followed by a healthy index-only transition
 and destruction; it does not seed driver history or touch NAS/service state.
 
@@ -94,7 +94,7 @@ Ext3 uses `-t ext3` with default allocation options: it already allocates withou
 delay and rejects an explicit `nodelalloc` option. The script confirms the
 `ext3` filesystem type from `/proc/mounts` and records its options in
 `mount-state.json`. Ext4 explicitly requests `delalloc`; XFS uses its defaults.
-The script checks snapshot state 3â†’tracking state 2, unchanged generation,
+The script checks snapshot state 3→tracking state 2, unchanged generation,
 nonzero changed-block count and error/cancel state. Each ioctl runs in a bounded
 child. If it times out, the script exits without joining a D-state child or
 attempting blocked driver cleanup. It prints the owned loop/mount/artifact path
@@ -111,22 +111,46 @@ successful transition is insufficient for the reported intermittent deadlock.
 
 ## Retain the original snapshot-read proof
 
-Separately, from the OpenSabba checkout, use its current native lab executable
-and the same compiled module. This test makes its own disposable ext4 loop
-volume and external COW, disables syscall hooks, and checks uncached snapshot
-reads against immutable bytes while scattered writes continue:
+Run the standalone driver harness from this repository, with the same compiled
+module and an initially unloaded driver. It uses the exported setup/info/destroy
+ioctls directly; no OpenSabba executable or removed lab commands are involved.
+The shared `driver_control.py` bindings also serve the transition harness.
 
 ```sh
 for repetition in 1 2 3 4 5; do
-  sudo python3 tests/test_snapshot_live.py /absolute/path/opensabba-lab \
-    --module /absolute/path/synosnap.ko --stress-seconds 30 --transitions
+  sudo python3 tests/snapshot_read_consistency.py --module "$module"     --stress-seconds 30 --deadline 30
 done
 ```
 
-All uncached reads must remain byte-exact, with healthy snapshot state; renewals
-and tracking must complete. Retain its immutable baseline, read hashes, changed
-block records and logs. This is the scenario fixed by e08cadf and must not be
-traded for successful transitions. Finally rerun the frozen batch-O C6 specimen
+Each run creates its own 64 MiB ext4 loop image and external 64 MiB COW, disables
+syscall hooks, saves a pre-write snapshot baseline, and starts the original
+writer workload: 64 proof-file overwrites, then scattered writes in a 32 MiB
+file using odd stride 2053 and distinct replacement bytes 252..255. Every full
+snapshot verification uses `BLKFLSBUF` on that owned snapshot and compares all
+bytes with the baseline. Require at least three uncached reads, nonzero
+scattered writes, a changed origin, healthy snapshot state, and the original
+proof text in the captured image. The default stress duration is 30 seconds.
+
+Retain `baseline.ext4`, `captured.ext4`, `reads.jsonl`, `snapshot-state.json` and
+`results.json` (read hashes/counts, write count and baseline hash). A mismatch
+retains `unstable.ext4`, changed-block offsets, and a copy of the COW. Bounded
+ioctl/read children preserve owned resources and print PIDs on timeout, like
+the transition gate. Successful runs destroy only their owned snapshot and
+clean up their loop/mount/module. All five runs must pass without new kernel
+warnings. Snapshot-to-tracking transitions are covered by the separate gate above.
+
+Offline checks include Python compilation and an ABI check against the driver's
+exported header (compile for both Linux x86_64 and aarch64 when cross tools are
+available):
+
+```sh
+python3 -m py_compile tests/driver_control.py tests/snapshot_read_consistency.py   tests/on_origin_transition.py
+cc -std=c11 -Wall -Wextra -Werror -c tests/ioctl_abi.c -o /tmp/synosnap-ioctl-abi.o
+```
+
+These checks do not execute ioctls or replace the five live read-oracle runs.
+
+Finally rerun the frozen batch-O C6 specimen
 with the separately approved tester workflow and confirm the original ext3
 origin reaches tracking after upload, then perform normal successor/readback
 checks. No existing source volume belongs to these standalone scripts.

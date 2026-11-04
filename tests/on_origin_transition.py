@@ -4,7 +4,6 @@ Run only in the disposable test VM. On timeout it preserves the module, loop,
 mount and child PID for kernel-stack collection instead of waiting on cleanup.
 """
 import argparse
-import ctypes as C
 import json
 import multiprocessing as M
 import os
@@ -14,38 +13,17 @@ import tempfile
 import time
 
 
-class Setup(C.Structure):
-    _fields_ = [('bdev',C.c_char_p),('cow',C.c_char_p),('mib',C.c_ulong),
-                ('cache',C.c_ulong),('minor',C.c_uint),('ignore',C.c_bool)]
-
-
-class Info(C.Structure):
-    _fields_ = [('cancelled',C.c_bool),('minor',C.c_uint),('flags',C.c_uint),
-        ('state',C.c_ulong),('error',C.c_int),('cache',C.c_ulong),('allocation',C.c_ulonglong),
-        ('sequence',C.c_ulonglong),('uuid',C.c_ubyte*16),('cow',C.c_char*4096),
-        ('bdev',C.c_char*4096),('version',C.c_ulonglong),('changed',C.c_ulonglong),('ignore',C.c_bool)]
+from driver_control import check_abi, control
 
 
 def control_child(pipe, operation, origin, cow):
-    libc = C.CDLL(None,use_errno=True)
     try:
         if operation in ('freeze','thaw'):
             subprocess.run(['fsfreeze','--freeze' if operation=='freeze' else '--unfreeze',str(cow)],
                 check=True,capture_output=True)
             pipe.send({})
             return
-        fd = os.open('/dev/synosnap-ctl',os.O_RDONLY)
-        try:
-            argument = (Setup(origin.encode(),str(cow).encode(),128,0,0,False) if operation=='setup'
-                        else Info(minor=0) if operation=='info' else C.c_uint(0))
-            request = dict(setup=0x40284101,info=0xa0604108,track=0x40044105,destroy=0x40044104)[operation]
-            result = libc.ioctl(fd,C.c_ulong(request),C.byref(argument))
-            if result:
-                raise OSError(C.get_errno(),operation)
-            pipe.send(dict(state=argument.state,error=argument.error,sequence=argument.sequence,
-                cancelled=argument.cancelled,changed=argument.changed) if operation=='info' else {})
-        finally:
-            os.close(fd)
+        pipe.send(control(operation,origin,cow))
     except Exception as error:
         pipe.send(dict(failure=repr(error)))
     finally:
@@ -75,7 +53,8 @@ def main():
     args = parser.parse_args()
     if os.geteuid()!=0 or Path('/sys/module/synosnap').exists():
         parser.error('requires root and an initially unloaded module in the disposable VM')
-    if args.iterations<1 or args.deadline<=0 or C.sizeof(Setup)!=40 or C.sizeof(Info)!=8288:
+    check_abi()
+    if args.iterations<1 or args.deadline<=0:
         parser.error('invalid bounds or unsupported ioctl ABI')
     root = Path(tempfile.mkdtemp(prefix='synosnap-on-origin-',dir='/var/tmp'))
     mount = root/'mount'
