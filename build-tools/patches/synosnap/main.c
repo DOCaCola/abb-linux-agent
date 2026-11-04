@@ -3429,6 +3429,22 @@ static int bio_overlap(const struct bio *bio1, const struct bio *bio2){
 	return max(bio_sector(bio1), bio_sector(bio2)) <= min(bio_sector(bio1) + (bio_size(bio1) / SECTOR_SIZE), bio_sector(bio2) + (bio_size(bio2) / SECTOR_SIZE));
 }
 
+static bool bio_queue_has_read(struct bio_queue *bq){
+	unsigned long flags;
+	struct bio *bio;
+	bool found = false;
+
+	spin_lock_irqsave(&bq->lock, flags);
+	bio_list_for_each(bio, &bq->bios){
+		if(!bio_data_dir(bio)){
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&bq->lock, flags);
+	return found;
+}
+
 static struct bio *bio_queue_dequeue_delay_read(struct bio_queue *bq){
 	unsigned long flags;
 	struct bio *bio, *tmp, *prev = NULL;
@@ -4078,7 +4094,15 @@ static int snap_cow_thread(void *data){
 
 	while(!kthread_should_stop() || !bio_queue_empty(bq) || atomic64_read(&dev->sd_submitted_cnt) != atomic64_read(&dev->sd_received_cnt)) {
 		//wait for a bio to process or a kthread_stop call
-		wait_event_interruptible(bq->event, kthread_should_stop() || !bio_queue_empty(bq));
+		wait_event_interruptible(bq->event, kthread_should_stop() || kthread_should_park() || !bio_queue_empty(bq));
+
+		/* A transition parks only after draining admitted readers and the
+		 * current COW write, while the filesystem is still unfrozen. Late
+		 * read-clone completions can remain buffered until after thaw. */
+		if(kthread_should_park() && !bio_queue_has_read(bq)){
+			kthread_parkme();
+			continue;
+		}
 
 		/*
 		/ We should pertend that the snapshot device is alive and don't give EIO on read even if it's in the failed state,
@@ -5782,6 +5806,44 @@ error:
 #define tracer_setup_unverified_inc(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors) __tracer_setup_unverified(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors, 0)
 #define tracer_setup_unverified_snap(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors) __tracer_setup_unverified(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors, 1)
 
+/* Readers are stopped and the COW worker is parked/stopped. Buffering old
+ * bytes is sufficient once no snapshot read can race with their publication.
+ * Future read-clone completions use the same queue lock and dormant policy. */
+static void __tracer_release_buffered_origins(struct snap_device *dev){
+	unsigned long flags;
+	struct bio *bio;
+	struct bio_sector_map *map;
+	struct tracing_params *tp;
+
+	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+	clear_bit(ACTIVE, &dev->sd_state);
+	bio_list_for_each(bio, &dev->sd_cow_bios.bios){
+		tp = bio->bi_private;
+		for(map = tp->bio_sects.head; map->bio != bio; map = map->next);
+		if(!map->orig_released){
+			map->orig_released = true;
+			tp_release_orig(tp);
+		}
+	}
+	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+}
+
+static void __tracer_start_cow_readers(struct snap_device *dev){
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+	set_bit(ACTIVE, &dev->sd_state);
+	atomic_set(&dev->sd_ignore_requests, 0);
+	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+#ifdef HAVE_BLK_STOP_QUEUE
+	spin_lock_irqsave(dev->sd_queue->queue_lock, flags);
+	blk_start_queue(dev->sd_queue);
+	spin_unlock_irqrestore(dev->sd_queue->queue_lock, flags);
+#else
+	blk_mq_start_stopped_hw_queues(dev->sd_queue, true);
+#endif
+}
+
 /************************IOCTL TRANSITION FUNCTIONS************************/
 
 static int tracer_active_snap_to_inc(struct snap_device *old_dev){
@@ -5806,20 +5868,42 @@ static int tracer_active_snap_to_inc(struct snap_device *old_dev){
 	__tracer_copy_base_dev(old_dev, dev);
 	__tracer_copy_cow_path(old_dev, dev);
 
-	//copy cow manager to new device. Care must be taken to make sure it isn't used by multiple threads at once.
-	__tracer_copy_cow(old_dev, dev);
-
 	//setup the cow thread
 	ret = __tracer_setup_inc_cow_thread(dev, old_dev->sd_minor);
 	if(ret) goto error;
 
+	/* The on-origin COW writer must not enter the journal while freeze
+	 * waits for original bios held behind that writer. Drain readers and
+	 * park before freeze; callbacks keep late clones buffered and release
+	 * original writes just as stock does. The shared COW manager remains
+	 * open, with no worker writing it during sync/freeze/tracing/thaw. */
+	__tracer_stop_cow_readers(old_dev);
+	ret = kthread_park(old_dev->sd_cow_thread);
+	if(ret){
+		__tracer_start_cow_readers(old_dev);
+		goto error;
+	}
+	__tracer_release_buffered_origins(old_dev);
+
+	// Transfer shared-manager ownership only after the old writer parks.
+	__tracer_copy_cow(old_dev, dev);
+
 	//inject the tracing function
 	ret = __tracer_setup_tracing(dev, old_dev->sd_minor);
-	if(ret) goto error;
+	if(ret){
+		/* Buffered clones precede newly admitted reads under the queue
+		 * lock, as on dormant reactivation. Restore the original snapshot
+		 * without retrying a failed filesystem freeze. */
+		old_dev->sd_cow->dev = old_dev;
+		__tracer_start_cow_readers(old_dev);
+		kthread_unpark(old_dev->sd_cow_thread);
+		goto error;
+	}
 
 	//Below this point, we are commited to the new device, so we must make sure it is in a good state.
 
 	//stop the old cow thread. Must be done before starting the new cow thread to prevent concurrent access.
+	kthread_unpark(old_dev->sd_cow_thread);
 	__tracer_destroy_cow_thread(old_dev);
 
 	//sanity check to ensure no errors have occurred while cleaning up the old cow thread
@@ -6392,25 +6476,9 @@ static long ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
 
 static void __tracer_active_to_dormant(struct snap_device *dev){
 	int ret;
-	unsigned long flags;
-	struct bio *bio;
-	struct bio_sector_map *map;
-	struct tracing_params *tp;
 
-	/* Stop and drain readers while active write ordering still holds. A
-	 * read clone may complete after the worker has observed an empty queue;
-	 * publish dormancy and release those queued writes under the same lock
-	 * that classifies new completions. No snapshot readers remain now. */
 	__tracer_destroy_cow_thread(dev);
-	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
-	clear_bit(ACTIVE, &dev->sd_state);
-	bio_list_for_each(bio, &dev->sd_cow_bios.bios){
-		tp = bio->bi_private;
-		for(map = tp->bio_sects.head; map->bio != bio; map = map->next);
-		map->orig_released = true;
-		tp_release_orig(tp);
-	}
-	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+	__tracer_release_buffered_origins(dev);
 
 	//close the cow manager
 	ret = __tracer_destroy_cow_sync_and_close(dev);
