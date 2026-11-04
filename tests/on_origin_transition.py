@@ -29,6 +29,11 @@ class Info(C.Structure):
 def control_child(pipe, operation, origin, cow):
     libc = C.CDLL(None,use_errno=True)
     try:
+        if operation in ('freeze','thaw'):
+            subprocess.run(['fsfreeze','--freeze' if operation=='freeze' else '--unfreeze',str(cow)],
+                check=True,capture_output=True)
+            pipe.send({})
+            return
         fd = os.open('/dev/synosnap-ctl',os.O_RDONLY)
         try:
             argument = (Setup(origin.encode(),str(cow).encode(),128,0,0,False) if operation=='setup'
@@ -64,6 +69,8 @@ def main():
     parser.add_argument('--module',required=True,type=Path)
     parser.add_argument('--filesystem',choices=('ext3','ext4','xfs'),required=True)
     parser.add_argument('--iterations',type=int,default=50)
+    parser.add_argument('--external-freeze',action='store_true',
+        help='also freeze/thaw the owned filesystem while its snapshot remains ACTIVE')
     parser.add_argument('--deadline',type=float,default=30)
     args = parser.parse_args()
     if os.geteuid()!=0 or Path('/sys/module/synosnap').exists():
@@ -78,7 +85,7 @@ def main():
         stream.truncate(1024*1024*1024)
     image.chmod(0o600)
     module = str(args.module.resolve())
-    loaded = mounted = owned = preserve = False
+    loaded = mounted = owned = preserve = externally_frozen = False
     loop = None
     process = None
     stop = M.Event()
@@ -145,6 +152,14 @@ def main():
             process = M.Process(target=writer,args=(data,stop))
             process.start()
             time.sleep(.1)
+            freeze_elapsed = None
+            if args.external_freeze:
+                freeze_start = time.monotonic()
+                ioctl('freeze',mount)
+                externally_frozen = True
+                ioctl('thaw',mount)
+                externally_frozen = False
+                freeze_elapsed = time.monotonic()-freeze_start
             start = time.monotonic()
             ioctl('track',cow)
             elapsed = time.monotonic()-start
@@ -161,12 +176,15 @@ def main():
             process = None
             ioctl('destroy',cow)
             owned = False
-            results.append(dict(iteration=iteration,seconds=elapsed,before=before,after=after))
+            results.append(dict(iteration=iteration,seconds=elapsed,external_freeze_seconds=freeze_elapsed,
+                                before=before,after=after))
             (root/'results.json').write_text(json.dumps(results,indent=2))
             print(json.dumps(results[-1]),flush=True)
     finally:
         stop.set()
         if not preserve:
+            if externally_frozen:
+                ioctl('thaw',mount)
             if process:
                 process.join(args.deadline)
                 if process.is_alive():

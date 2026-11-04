@@ -1051,7 +1051,7 @@ struct bio_sector_map{
 	struct bio *bio;
 	sector_t sect;
 	unsigned int size;
-	bool orig_released; // dormant clone has released its origin-write dependency
+	bool orig_released; // buffered clone has released its origin-write dependency
 	struct bio_sector_map *next;
 };
 
@@ -1142,6 +1142,8 @@ struct snap_device{
 										//wrapped into tracing_ops structure with the ref counter.
 #endif
 	make_request_fn *sd_orig_mrf; //block device's original make request function
+	struct bio *sd_snapshot_read; // current read, protected by sd_cow_bios.lock
+	sector_t sd_snapshot_read_start, sd_snapshot_read_end; // stable while the bio iterator advances
 	struct task_struct *sd_cow_thread; //thread for handling file read/writes
 	struct bio_queue sd_cow_bios; //list of outstanding cow bios
 	struct task_struct *sd_mrf_thread; //thread for handling file read/writes
@@ -3127,10 +3129,9 @@ static int cow_init(struct snap_device *dev, const char *path, uint64_t elements
 	ret = file_allocate(cm, cm->filp, 0, file_max);
 	if(ret) goto error;
 
-	/* Internal COW writes must never allocate extents or join a filesystem
-	 * metadata transaction while origin writes are waiting for their saved
-	 * data. Initialize preallocated extents before tracing is installed,
-	 * then write COW data/index without inode timestamp transactions. */
+	/* Initialize preallocated extents before tracing so later COW writes
+	 * do not allocate filesystem blocks. They still obey normal writer
+	 * admission and can require filesystem journal handles. */
 	{
 		void *zero = (void *)get_zeroed_page(GFP_KERNEL);
 		uint64_t at;
@@ -3180,7 +3181,7 @@ static void cow_modify_cache_size(struct cow_manager *cm, unsigned long cache_si
 	cm->allowed_sects = __cow_calculate_allowed_sects(cache_size, cm->total_sects);
 }
 
-static int cow_read_mapping(struct cow_manager *cm, uint64_t pos, uint64_t *out){
+static int cow_read_mapping(struct cow_manager *cm, uint64_t pos, uint64_t *out, bool writeback){
 	int ret;
 	uint64_t sect_idx = pos;
 	unsigned long sect_pos = do_div(sect_idx, cm->sect_size);
@@ -3206,7 +3207,7 @@ static int cow_read_mapping(struct cow_manager *cm, uint64_t pos, uint64_t *out)
 	nl_trace_event_cow(NL_EVENT_COW_READ_MAPPING, pos, *out);
 #endif
 
-	if(cm->allocated_sects > cm->allowed_sects){
+	if(writeback && cm->allocated_sects > cm->allowed_sects){
 		ret = __cow_cleanup_mappings(cm);
 		if(ret) goto error;
 	}
@@ -3315,7 +3316,7 @@ static int cow_write_current(struct cow_manager *cm, uint64_t block, void *buf){
 	uint64_t block_mapping;
 
 	//read this mapping from the cow manager
-	ret = cow_read_mapping(cm, block, &block_mapping);
+	ret = cow_read_mapping(cm, block, &block_mapping, true);
 	if(ret) goto error;
 
 	//if the block mapping already exists return so we don't overwrite it
@@ -3445,7 +3446,8 @@ static bool bio_queue_has_read(struct bio_queue *bq){
 	return found;
 }
 
-static struct bio *bio_queue_dequeue_delay_read(struct bio_queue *bq){
+static struct bio *bio_queue_dequeue_delay_read(struct snap_device *dev){
+	struct bio_queue *bq = &dev->sd_cow_bios;
 	unsigned long flags;
 	struct bio *bio, *tmp, *prev = NULL;
 
@@ -3471,6 +3473,11 @@ static struct bio *bio_queue_dequeue_delay_read(struct bio_queue *bq){
 	}
 
 out:
+	if(!bio_data_dir(bio)){
+		dev->sd_snapshot_read = bio;
+		dev->sd_snapshot_read_start = bio_sector(bio);
+		dev->sd_snapshot_read_end = bio_sector(bio) + bio_size(bio) / SECTOR_SIZE;
+	}
 	spin_unlock_irqrestore(&bq->lock, flags);
 
 	return bio;
@@ -3711,6 +3718,25 @@ static void bio_free_clone(struct bio *bio){
 	else tp_put(tp);
 }
 
+/* Caller holds sd_cow_bios.lock. Completed clones already own the old
+ * bytes, so only an in-progress overlapping snapshot read can still need
+ * its original write delayed. No COW file write is needed to release it. */
+static void __tracer_release_queued_origins_locked(struct snap_device *dev){
+	struct bio *bio;
+	struct bio_sector_map *map;
+	struct tracing_params *tp;
+
+	bio_list_for_each(bio, &dev->sd_cow_bios.bios){
+		if(!bio_data_dir(bio)) continue;
+		tp = bio->bi_private;
+		for(map = tp->bio_sects.head; map->bio != bio; map = map->next);
+		if(!map->orig_released){
+			map->orig_released = true;
+			tp_release_orig(tp);
+		}
+	}
+}
+
 static int bio_make_read_clone(struct block_device *bdev, struct bio_set *bs, struct tracing_params *tp, struct bio *orig_bio, sector_t sect, unsigned int pages, struct bio **bio_out, unsigned int *bytes_added){
 	int ret;
 	struct bio *new_bio;
@@ -3821,7 +3847,7 @@ static int snap_read_bio_get_mode(const struct snap_device *dev, struct bio *bio
 			curr_end_byte += min(COW_BLOCK_SIZE - (curr_byte % COW_BLOCK_SIZE), ((uint64_t)bio_iter_len(bio, iter) - bytes));
 
 			//check if the mapping exists
-			ret = cow_read_mapping(dev->sd_cow, curr_byte / COW_BLOCK_SIZE, &block_mapping);
+			ret = cow_read_mapping(dev->sd_cow, curr_byte / COW_BLOCK_SIZE, &block_mapping, false);
 			if(ret) goto error;
 
 			if(!start_mode && block_mapping) start_mode = READ_MODE_COW_FILE;
@@ -3919,7 +3945,7 @@ static int snap_handle_read_bio(const struct snap_device *dev, struct bio *bio){
 			while(bvec_off < bvec->bv_offset + bvec->bv_len){
 				bytes_to_copy = min(bvec->bv_offset + bvec->bv_len - bvec_off, COW_BLOCK_SIZE - block_off);
 				//check if the mapping exists
-				ret = cow_read_mapping(dev->sd_cow, cur_block, &block_mapping);
+				ret = cow_read_mapping(dev->sd_cow, cur_block, &block_mapping, false);
 				if(ret){
 					kunmap(bvec->bv_page);
 					goto out;
@@ -4083,6 +4109,26 @@ static int snap_mrf_thread(void *data){
 	return 0;
 }
 
+static void snap_complete_read_bio(struct snap_device *dev, struct bio *bio, int error){
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
+	dev->sd_snapshot_read = NULL;
+	__tracer_release_queued_origins_locked(dev);
+	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
+	/* Mapping lookups during a guarded read must not evict dirty sections:
+	 * that would write the COW file while an original is still delayed.
+	 * The bytes are now safe, so perform deferred writeback before endio. */
+	if(!error && dev->sd_cow->allocated_sects > dev->sd_cow->allowed_sects){
+		error = __cow_cleanup_mappings(dev->sd_cow);
+		if(error){
+			tracer_set_fail_state(dev, error);
+			error = wrap_err_io(dev);
+		}
+	}
+	elastio_snap_bio_endio(bio, error);
+}
+
 static int snap_cow_thread(void *data){
 	int ret, is_failed = 0;
 	struct snap_device *dev = data;
@@ -4120,19 +4166,19 @@ static int snap_cow_thread(void *data){
 		if(bio_queue_empty(bq)) continue;
 
 		//safely dequeue a bio
-		bio = bio_queue_dequeue_delay_read(bq);
+		bio = bio_queue_dequeue_delay_read(dev);
 
 		//pass bio to handler
 		if(!bio_data_dir(bio)){
 			//if we're in the fail state just send back an IO error and free the bio
 			if(is_failed){
-				elastio_snap_bio_endio(bio, wrap_err_io(dev)); //end the bio with an IO error
+				snap_complete_read_bio(dev, bio, wrap_err_io(dev)); //end the bio with an IO error
 				continue;
 			}
 
 			if (dev->sd_cow && snap_is_cancelled(dev->sd_cow)) {
 				LOG_DEBUG("cancelling read bio: sect = %llu size = %u", (unsigned long long)bio_sector(bio), bio_size(bio) / 512);
-				elastio_snap_bio_endio(bio, -EFBIG);
+				snap_complete_read_bio(dev, bio, -EFBIG);
 				continue;
 			}
 
@@ -4142,7 +4188,7 @@ static int snap_cow_thread(void *data){
 				tracer_set_fail_state(dev, ret);
 			}
 
-			elastio_snap_bio_endio(bio, (ret)? wrap_err_io(dev) : 0);
+			snap_complete_read_bio(dev, bio, (ret)? wrap_err_io(dev) : 0);
 		}else{
 			if(is_failed){
 				atomic64_inc(&dev->sd_processed_cnt);
@@ -4222,7 +4268,7 @@ static int inc_sset_thread(void *data){
 static void __on_bio_read_complete(struct bio *bio, int err){
 	int ret;
 	unsigned long flags;
-	bool dormant;
+	bool release_orig;
 	struct bio_queue *bq;
 	struct tracing_params *tp = bio->bi_private;
 	struct snap_device *dev = tp->dev;
@@ -4249,6 +4295,7 @@ static void __on_bio_read_complete(struct bio *bio, int err){
 	for(map = tp->bio_sects.head; map != NULL && map->bio != NULL; map = map->next) {
 		if(bio == map->bio){
 			bio_sector(bio) = map->sect - dev->sd_sect_off;
+			bio_size(bio) = map->size;
 			bio_idx(bio) = 0;
 			break;
 		}
@@ -4266,24 +4313,21 @@ static void __on_bio_read_complete(struct bio *bio, int err){
 	}
 #endif
 
-	/* Retain the clone's tracing reference while it waits for the COW worker.
-	 * Releasing the original write here can race with a snapshot read whose
-	 * unmapped range is already being read from the base device. Both COW
-	 * writes and snapshot reads run on sd_cow_thread: releasing the original
-	 * only after COW processing makes the saved mapping visible first.
-	 */
+	/* Buffered old bytes protect future snapshot reads. Delay an original
+	 * only if it overlaps the read already being serviced: that read may
+	 * already have submitted an unmapped origin read. The marker is set
+	 * while dequeuing under this same lock, before a clone can release it.
+	 * A COW file writer may wait for filesystem thaw, but never holds an
+	 * original journal write hostage while doing so. */
 #ifdef NETLINK_DEBUG
 	nl_trace_event_bio(NL_EVENT_BIO_QUEUED, bio, 0);
 #endif
-	/* Serialize dormancy selection and clone publication with reactivation.
-	 * Every early-released clone must precede newly admitted snapshot reads.
-	 * Readers are quiesced before ACTIVE is cleared. During dormancy their
-	 * old data stays buffered, as in stock, while final ext4 writes complete.
-	 */
 	bq = &dev->sd_cow_bios;
 	spin_lock_irqsave(&bq->lock, flags);
-	dormant = !test_bit(ACTIVE, &dev->sd_state);
-	if(dormant){
+	release_orig = !dev->sd_snapshot_read ||
+		bio_sector(bio) + bio_size(bio) / SECTOR_SIZE <= dev->sd_snapshot_read_start ||
+		bio_sector(bio) >= dev->sd_snapshot_read_end;
+	if(release_orig){
 		map->orig_released = true;
 		/* Keep tp alive if the worker frees this clone after publication. */
 		atomic_inc(&tp->refs);
@@ -4293,7 +4337,7 @@ static void __on_bio_read_complete(struct bio *bio, int err){
 	wake_up(&bq->event);
 	atomic64_inc(&dev->sd_received_cnt);
 	smp_wmb();
-	if(dormant){
+	if(release_orig){
 		tp_release_orig(tp);
 		tp_release(tp);
 	}
@@ -5822,25 +5866,15 @@ error:
 #define tracer_setup_unverified_inc(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors) __tracer_setup_unverified(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors, 0)
 #define tracer_setup_unverified_snap(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors) __tracer_setup_unverified(dev, minor, bdev_path, cow_path, cache_size, ignore_snap_errors, 1)
 
-/* Readers are stopped and the COW worker is parked/stopped. Buffering old
- * bytes is sufficient once no snapshot read can race with their publication.
- * Future read-clone completions use the same queue lock and dormant policy. */
+/* Readers are stopped and the COW worker is parked/stopped. Buffered old
+ * bytes suffice; no current read can still need an original write delayed.
+ * Future completions use the same queue lock and current-read marker. */
 static void __tracer_release_buffered_origins(struct snap_device *dev){
 	unsigned long flags;
-	struct bio *bio;
-	struct bio_sector_map *map;
-	struct tracing_params *tp;
 
 	spin_lock_irqsave(&dev->sd_cow_bios.lock, flags);
 	clear_bit(ACTIVE, &dev->sd_state);
-	bio_list_for_each(bio, &dev->sd_cow_bios.bios){
-		tp = bio->bi_private;
-		for(map = tp->bio_sects.head; map->bio != bio; map = map->next);
-		if(!map->orig_released){
-			map->orig_released = true;
-			tp_release_orig(tp);
-		}
-	}
+	__tracer_release_queued_origins_locked(dev);
 	spin_unlock_irqrestore(&dev->sd_cow_bios.lock, flags);
 }
 
