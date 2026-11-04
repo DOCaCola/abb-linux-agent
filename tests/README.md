@@ -62,8 +62,11 @@ sudo python3 tests/on_origin_transition.py --module "$module" \
   --filesystem xfs --iterations 50 --deadline 30
 ```
 
-Ext3 is explicitly mounted `nodelalloc`; ext4 uses `delalloc`. The script checks
-the actual mount options, snapshot state 3→tracking state 2, unchanged generation,
+Ext3 uses `-t ext3` with default allocation options: it already allocates without
+delay and rejects an explicit `nodelalloc` option. The script confirms the
+`ext3` filesystem type from `/proc/mounts` and records its options in
+`mount-state.json`. Ext4 explicitly requests `delalloc`; XFS uses its defaults.
+The script checks snapshot state 3→tracking state 2, unchanged generation,
 nonzero changed-block count and error/cancel state. Each ioctl runs in a bounded
 child. If it times out, the script exits without joining a D-state child or
 attempting blocked driver cleanup. It prints the owned loop/mount/artifact path

@@ -111,7 +111,9 @@ def main():
         loaded = True
         run('udevadm','settle')
         loop = run('losetup','--find','--show',str(image))
-        options = 'nodev,nosuid'+(',nodelalloc' if args.filesystem=='ext3' else ',delalloc' if args.filesystem=='ext4' else '')
+        # The ext3 compatibility mount already uses immediate allocation and
+        # rejects ext4's explicit nodelalloc option.
+        options = 'nodev,nosuid'+(',delalloc' if args.filesystem=='ext4' else '')
         run('mount','-t',args.filesystem,'-o',options,loop,str(mount))
         mounted = True
         cow_dir = mount/'.synosnap_data'
@@ -122,9 +124,17 @@ def main():
                 stream.write(bytes([i%251])*4096)
             os.fsync(stream.fileno())
         run('sync','-f',str(mount))
-        options = run('findmnt','-n','-o','OPTIONS','--target',str(mount))
-        if args.filesystem=='ext3' and 'nodelalloc' not in options.split(','):
-            raise RuntimeError('ext3 specimen is missing nodelalloc')
+        mounts = [line.split() for line in Path('/proc/mounts').read_text().splitlines()
+                  if line.split()[1]==str(mount)]
+        assert len(mounts)==1 and mounts[0][0]==loop and mounts[0][2]==args.filesystem
+        options = mounts[0][3].split(',')
+        if args.filesystem=='ext3':
+            assert 'delalloc' not in options
+        mounted_state = dict(device=loop,filesystem=mounts[0][2],options=options,
+                             allocation='immediate (ext3)' if args.filesystem=='ext3'
+                             else 'delalloc requested' if args.filesystem=='ext4' else 'XFS default')
+        (root/'mount-state.json').write_text(json.dumps(mounted_state,indent=2))
+        print(json.dumps(dict(mounted_state=mounted_state)),flush=True)
         for iteration in range(args.iterations):
             cow = cow_dir/f'cow-{iteration}'
             ioctl('setup',cow)
