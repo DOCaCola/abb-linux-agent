@@ -1202,6 +1202,8 @@ static int elastio_snap_proc_release(struct inode *inode, struct file *file);
 // wait msec value to be at least 100 msec as wait loop uses it by msleep of (100) timeout pieces
 #define ELASTIO_SNAP_WAIT_FOR_RELEASE_MSEC              5000
 #define ELASTIO_SNAP_WAIT_FOR_RELEASE_MAX_SLEEP_COUNT   1000
+static int __tracer_park_snapshot(struct snap_device *dev);
+static void __tracer_unpark_snapshot(struct snap_device *dev, bool readers);
 static void elastio_snap_wait_for_release(struct snap_device *dev);
 
 #ifdef USE_BDOPS_SUBMIT_BIO
@@ -2122,12 +2124,10 @@ static inline ssize_t elastio_snap_kernel_write(struct cow_manager *cm, void *bu
 
 		return ret;
 #else
-		/* The COW worker is part of the origin's freeze/thaw operation.
-		 * Thaw can submit a superblock write which waits for its saved COW
-		 * block. Taking sb_start_write here would wait for thaw itself.
-		 * These preallocated internal writes must bypass the ordinary
-		 * filesystem writer admission, like the dormant direct-I/O path. */
-		ret = __kernel_write(cm->filp, buf, count, pos);
+		/* File-backed COW writes obey normal filesystem writer admission.
+		 * Snapshot workers buffer/release origin dependencies and park
+		 * across our freeze/thaw boundaries, including initial publication. */
+		ret = kernel_write(cm->filp, buf, count, pos);
 		return ret;
 #endif
 	} else {
@@ -4916,6 +4916,7 @@ static int __tracer_transition_tracing(struct snap_device *dev, struct block_dev
 static int __tracer_transition_tracing(struct snap_device *dev, struct block_device *bdev, const struct block_device_operations *new_ops, struct snap_device **dev_ptr, bool start){
 #endif
 	int ret;
+	bool snapshot_parked = false;
 	struct super_block *origsb = elastio_snap_get_super(bdev);
 	char bdev_name[BDEVNAME_SIZE];
 	MAYBE_UNUSED(ret);
@@ -4923,6 +4924,18 @@ static int __tracer_transition_tracing(struct snap_device *dev, struct block_dev
 	elastio_snap_bdevname(bdev, bdev_name);
 
 	if(origsb){
+		/* Initial setup and renewal publish a new snapshot while the
+		 * filesystem is frozen. Its thaw writes must release originals
+		 * from buffered clones without entering the frozen journal. */
+		if(test_bit(SNAPSHOT, &dev->sd_state) &&
+				test_bit(ACTIVE, &dev->sd_state) && dev->sd_cow_thread){
+			ret = __tracer_park_snapshot(dev);
+			if(ret){
+				drop_super(origsb);
+				return ret;
+			}
+			snapshot_parked = true;
+		}
 		LOG_DEBUG("force syncing the disk '%s'", bdev_name);
 		sync_filesystem(origsb);
 		drop_super(origsb);
@@ -4949,6 +4962,7 @@ static int __tracer_transition_tracing(struct snap_device *dev, struct block_dev
 		/* ret = elastio_snap_freeze_bdev(bdev, &sb); */
 		if (ret) {
 			LOG_ERROR((ret), "error freezing '%s': error", bdev_name);
+			if(snapshot_parked) __tracer_unpark_snapshot(dev, true);
 			return ret;
 		}
 	}
@@ -5026,6 +5040,8 @@ static int __tracer_transition_tracing(struct snap_device *dev, struct block_dev
 			//pretend we succeeded so we don't break the block device
 		}
 	}
+
+	if(snapshot_parked) __tracer_unpark_snapshot(dev, start);
 
 	return 0;
 }
@@ -5844,6 +5860,24 @@ static void __tracer_start_cow_readers(struct snap_device *dev){
 #endif
 }
 
+static int __tracer_park_snapshot(struct snap_device *dev){
+	int ret;
+
+	__tracer_stop_cow_readers(dev);
+	ret = kthread_park(dev->sd_cow_thread);
+	if(ret){
+		__tracer_start_cow_readers(dev);
+		return ret;
+	}
+	__tracer_release_buffered_origins(dev);
+	return 0;
+}
+
+static void __tracer_unpark_snapshot(struct snap_device *dev, bool readers){
+	if(readers) __tracer_start_cow_readers(dev);
+	kthread_unpark(dev->sd_cow_thread);
+}
+
 /************************IOCTL TRANSITION FUNCTIONS************************/
 
 static int tracer_active_snap_to_inc(struct snap_device *old_dev){
@@ -5877,13 +5911,8 @@ static int tracer_active_snap_to_inc(struct snap_device *old_dev){
 	 * park before freeze; callbacks keep late clones buffered and release
 	 * original writes just as stock does. The shared COW manager remains
 	 * open, with no worker writing it during sync/freeze/tracing/thaw. */
-	__tracer_stop_cow_readers(old_dev);
-	ret = kthread_park(old_dev->sd_cow_thread);
-	if(ret){
-		__tracer_start_cow_readers(old_dev);
-		goto error;
-	}
-	__tracer_release_buffered_origins(old_dev);
+	ret = __tracer_park_snapshot(old_dev);
+	if(ret) goto error;
 
 	// Transfer shared-manager ownership only after the old writer parks.
 	__tracer_copy_cow(old_dev, dev);
@@ -5895,15 +5924,14 @@ static int tracer_active_snap_to_inc(struct snap_device *old_dev){
 		 * lock, as on dormant reactivation. Restore the original snapshot
 		 * without retrying a failed filesystem freeze. */
 		old_dev->sd_cow->dev = old_dev;
-		__tracer_start_cow_readers(old_dev);
-		kthread_unpark(old_dev->sd_cow_thread);
+		__tracer_unpark_snapshot(old_dev, true);
 		goto error;
 	}
 
 	//Below this point, we are commited to the new device, so we must make sure it is in a good state.
 
 	//stop the old cow thread. Must be done before starting the new cow thread to prevent concurrent access.
-	kthread_unpark(old_dev->sd_cow_thread);
+	__tracer_unpark_snapshot(old_dev, false);
 	__tracer_destroy_cow_thread(old_dev);
 
 	//sanity check to ensure no errors have occurred while cleaning up the old cow thread

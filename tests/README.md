@@ -1,10 +1,12 @@
 # Snapshot-to-tracking freeze regression
 
-The old snapshot COW worker is parked before sync/freeze and only resumed after
-thaw. Snapshot readers have drained first; late cloned old bytes remain buffered
+Snapshot COW workers are parked before sync/freeze and only resumed after
+thaw, including the new worker at initial snapshot publication and renewal. Snapshot readers have drained first; late cloned old bytes remain buffered
 and their original writes are released with the existing dormant policy. The
 old worker then drains before the new incremental worker starts. Active snapshot
-reads retain the e08cadf ordering. No user-space freeze or retry is needed.
+reads retain the e08cadf ordering. File-backed writes use stock kernel_write
+writer admission; the global __kernel_write bypass is removed. No user-space
+freeze or retry is needed.
 
 ## Offline ordering check
 
@@ -13,15 +15,24 @@ From this repository root:
 ```sh
 python3 tests/transition_ordering.py --cc cc
 python3 tests/transition_ordering.py --cc cc --control-revision 78520e8
+python3 tests/transition_ordering.py --cc cc --publication-control-revision 99a5e13
+python3 tests/transition_ordering.py --cc cc --writer-control-revision 99a5e13
 ```
 
 This compiles the actual source functions with `-std=c11 -Wall -Wextra -Werror`
-and deterministic kernel interposition. Six cases cover reader drain before
+and deterministic kernel interposition. Nine cases cover reader drain before
 park, no old COW writer during freeze, old/new manager serialization, rejected
 park, rejected freeze with restored snapshot/manager ownership, failed old COW
-cleanup, truncation warning and already-released clone refcounts. This is a
+cleanup, truncation warning, already-released clone refcounts, initial/renewed
+snapshot publication, tracing removal, and normal writer admission through the
+entire thaw callback. The actual common tracing transition and COW write wrapper
+are compiled, rather than replacing the complete freeze/thaw path with a stub.
+The shim represents waiting at writer admission with a sentinel return; it does
+not predict a real kernel_write error. This is a
 control-flow/refcount test, not a kernel/journal or snapshot-content proof.
-The historical-control command must reject 78520e8 at the freeze-safety oracle.
+All three historical-control commands must reject their old implementation: the
+78520e8 retiring-worker path, 99a5e13 new-snapshot publication and the 693820e
+writer-admission bypass.
 
 ## Build on the exact test kernel
 
@@ -76,7 +87,9 @@ Successful runs clean up only their own snapshot, mount, loop and module and
 retain `results.json` with all transition durations.
 
 Require all 50 repetitions on each filesystem, no D-state transition/writer,
-no new filesystem/driver error, and ordinary unmount/module unload. A single
+no new filesystem/driver warning or error, and ordinary unmount/module unload.
+A transition completing with ext4_journal_check_start warnings still fails the
+gate; 99a5e13 completed 50 ext3 repetitions but produced one warning per cycle. A single
 successful transition is insufficient for the reported intermittent deadlock.
 
 ## Retain the original snapshot-read proof
