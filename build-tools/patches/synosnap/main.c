@@ -2803,7 +2803,8 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 	unsigned int fiemap_mapped_extents_size, i_ext;
 	struct fiemap_extent *extent;
 	char parent_process_name[TASK_COMM_LEN];
-	unsigned long vm_flags = VM_READ | VM_WRITE;
+	/* VM_MAY* as mmap() sets them: write faults require VM_MAYWRITE. */
+	unsigned long vm_flags = VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE;
 	unsigned long start_addr;
 	struct task_struct *task;
 	struct vm_area_struct *vma;
@@ -2832,8 +2833,10 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 	elastio_snap_mm_lock(task->mm);
 
 	start_addr = elastio_snap_get_unmapped_area(NULL, 0, cow_ext_buf_size, 0, VM_READ | VM_WRITE);
-	if (IS_ERR_VALUE(start_addr))
+	if (IS_ERR_VALUE(start_addr)) {
+		elastio_snap_mm_unlock(task->mm);
 		return start_addr; // returns -EPERM if failed
+	}
 
 	// we must give fiemap() a userspace buffer, so we
 	// brutally impose pages to the parent process
@@ -2882,6 +2885,13 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 
 	cow_ext_buf = (__user uint8_t *) start_addr;
 
+	/* The mapping is complete. fiemap() writes the extents with
+	 * copy_to_user(), which faults on CPUs that update the dirty bit in
+	 * software (e.g. Cortex-A72); that fault takes this mm's mmap lock, so
+	 * holding it here would block until a fatal signal and fail the write
+	 * with -EFAULT. */
+	elastio_snap_mm_unlock(task->mm);
+
 	if (filp->f_inode->i_op)
 		fiemap = filp->f_inode->i_op->fiemap;
 
@@ -2924,8 +2934,7 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 
 out:
 	ClearPageReserved(pg);
-	elastio_snap_mm_unlock(task->mm);
-	vm_munmap(vma->vm_start, cow_ext_buf_size);
+	vm_munmap(start_addr, cow_ext_buf_size);
 	__free_pages(pg, get_order(cow_ext_buf_size));
 	return ret;
 }
