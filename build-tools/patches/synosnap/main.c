@@ -1596,7 +1596,6 @@ static int file_open(const char *filename, int flags, struct file **filp){
 		goto error;
 	}
 	f->f_mode |= FMODE_NONOTIFY;
-	f->f_inode->i_flags |= S_NOCMTIME;
 
 	*filp = f;
 	return 0;
@@ -3129,23 +3128,6 @@ static int cow_init(struct snap_device *dev, const char *path, uint64_t elements
 	ret = file_allocate(cm, cm->filp, 0, file_max);
 	if(ret) goto error;
 
-	/* Initialize preallocated extents before tracing so later COW writes
-	 * do not allocate filesystem blocks. They still obey normal writer
-	 * admission and can require filesystem journal handles. */
-	{
-		void *zero = (void *)get_zeroed_page(GFP_KERNEL);
-		uint64_t at;
-		if (!zero) { ret = -ENOMEM; goto error; }
-		for (at = 0; at < file_max; at += PAGE_SIZE) {
-			ret = file_write(cm, zero, at, min_t(uint64_t, PAGE_SIZE, file_max - at));
-			if (ret) break;
-			cond_resched();
-		}
-		free_page((unsigned long)zero);
-		if (ret) goto error;
-		ret = vfs_fsync(cm->filp, 0);
-		if (ret) goto error;
-	}
 	dev->sd_cow_inode = cm->filp->f_inode;
 
 	*cm_out = cm;
